@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS batches (
     expected_start  INTEGER NOT NULL,
     expected_end    INTEGER NOT NULL,
     frames_json     TEXT NOT NULL,
+    frames_raw_json TEXT,
     frames_merged_json TEXT NOT NULL DEFAULT '[]',
     duplicates_json TEXT NOT NULL DEFAULT '[]',
     content_hash    TEXT NOT NULL,
@@ -79,12 +80,20 @@ CREATE INDEX IF NOT EXISTS idx_claims_roll ON rescan_claims (roll_no);
 
 
 def init_db() -> None:
-    """幂等建表：每次启动执行，已存在的库不受影响。"""
+    """幂等建表 + 轻量迁移：每次启动执行，已存在的库不受影响。"""
     conn = _connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为既有库补充新增列（老库中该列为 NULL，表示缺少原始帧列表的存量批次）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)")}
+    if "frames_raw_json" not in cols:
+        conn.execute("ALTER TABLE batches ADD COLUMN frames_raw_json TEXT")
 
 
 @contextmanager

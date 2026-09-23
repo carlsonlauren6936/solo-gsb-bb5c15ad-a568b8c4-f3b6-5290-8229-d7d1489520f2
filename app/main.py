@@ -20,8 +20,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持补扫任务认领。",
-    version="1.1.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；"
+    "支持撤销误导入批次与补扫任务认领。",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -57,6 +58,24 @@ def submit_batch(
 @app.get("/batches/{batch_id}", response_model=schemas.BatchResult, tags=["批次"])
 def get_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
     result = services.get_batch(conn, batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return result
+
+
+@app.delete("/batches/{batch_id}", response_model=schemas.BatchDeleteResult, tags=["批次"])
+def delete_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
+    """撤销（删除）一个误导入的批次。
+
+    在同一 SQLite 写事务中删除该批次，并按剩余批次的原导入顺序重建预期范围、
+    帧归属及各批新增帧/重复帧明细（批内重复保留，共享帧不随首个批次丢失）。
+    批次不存在返回 404；剩余批次含无法区分批内与跨批重复的存量数据时返回 409
+    且不改动数据。删除最后一批后胶卷视为不存在，其历史补扫认领一并清除。
+    """
+    try:
+        result = services.delete_batch(conn, batch_id.strip())
+    except services.LegacyBatchDataError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return result

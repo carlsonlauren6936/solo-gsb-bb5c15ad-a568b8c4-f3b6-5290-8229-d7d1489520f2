@@ -75,6 +75,18 @@ class RollSummary(BaseModel):
     missing_ranges: list[list[int]]
 
 
+class BatchDeleteResult(BaseModel):
+    batch_id: str
+    roll_no: str
+    roll_exists: bool = Field(
+        ..., description="撤销后该胶卷是否仍有批次；False 表示胶卷已不存在"
+    )
+    roll_state: "RollState | None" = Field(
+        ...,
+        description="撤销并按剩余批次重算后的胶卷状态；最后一批被撤销（胶卷不存在）时为 null",
+    )
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

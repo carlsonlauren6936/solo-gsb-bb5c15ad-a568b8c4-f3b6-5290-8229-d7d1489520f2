@@ -1,4 +1,4 @@
-"""核心业务逻辑：批次导入、跨批次合并、缺帧区间计算、补扫任务认领。"""
+"""核心业务逻辑：批次导入、批次撤销、跨批次合并、缺帧区间计算、补扫任务认领。"""
 from __future__ import annotations
 
 import hashlib
@@ -258,14 +258,16 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
         conn.execute(
             """INSERT INTO batches
                (id, roll_no, expected_start, expected_end, frames_json,
-                frames_merged_json, duplicates_json, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                frames_raw_json, frames_merged_json, duplicates_json, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 batch_id,
                 data.roll_no,
                 data.expected_start,
                 data.expected_end,
                 json.dumps(frames),
+                # 原始帧列表（含批内重复、保持提交顺序），供撤销批次时重算批内/跨批重复
+                json.dumps(data.frames),
                 json.dumps(new_frames),
                 json.dumps(duplicates),
                 digest,
@@ -306,6 +308,103 @@ class BatchIdConflictError(Exception):
     def __init__(self, batch_id: str):
         self.batch_id = batch_id
         super().__init__(f"batch_id 已被其他内容占用: {batch_id}")
+
+
+# ---------- 批次撤销 ----------
+
+class LegacyBatchDataError(Exception):
+    """剩余批次中存在未保留原始帧列表的存量数据，无法区分批内与跨批重复，拒绝撤销。"""
+
+    def __init__(self, roll_no: str):
+        self.roll_no = roll_no
+        super().__init__(
+            f"胶卷 '{roll_no}' 的其余批次为早期数据，缺少原始帧列表，"
+            "无法区分批内与跨批重复，已取消撤销（数据未改动）"
+        )
+
+
+def delete_batch(
+    conn: sqlite3.Connection, batch_id: str
+) -> schemas.BatchDeleteResult | None:
+    """撤销（删除）一个误导入的批次，并在同一写事务中重建该胶卷的派生数据。
+
+    重建方式：按剩余批次的原导入顺序重放——
+    - 预期范围：由剩余批次的 (expected_start, expected_end) 重新写入；
+    - 帧归属：每帧归属剩余批次中最早包含它的批次，共享帧不随首个批次丢失；
+    - 各批 added_frames / duplicates：按重放顺序重算，批内重复照常保留。
+
+    批次不存在返回 None；剩余批次含缺少原始帧列表的存量数据时抛
+    LegacyBatchDataError（由路由转为 409），且不改动任何数据。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT id, roll_no FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None
+        roll_no = row["roll_no"]
+
+        remaining = conn.execute(
+            """SELECT id, expected_start, expected_end, frames_raw_json
+                 FROM batches
+                WHERE roll_no = ? AND id != ?
+                ORDER BY created_at, rowid""",
+            (roll_no, batch_id),
+        ).fetchall()
+        if any(r["frames_raw_json"] is None for r in remaining):
+            raise LegacyBatchDataError(roll_no)
+
+        # 先清掉旧的派生数据（roll_frames 有指向批次的外键，须先于批次本体删除）
+        conn.execute("DELETE FROM roll_frames WHERE roll_no = ?", (roll_no,))
+        conn.execute("DELETE FROM roll_expected WHERE roll_no = ?", (roll_no,))
+        conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+
+        if not remaining:
+            # 最后一批被撤销：胶卷视为不存在，历史补扫认领一并清除，
+            # 避免阻碍同编号胶卷重新导入后的领取
+            conn.execute("DELETE FROM rescan_claims WHERE roll_no = ?", (roll_no,))
+        else:
+            seen: set[int] = set()
+            for r in remaining:  # 按原导入顺序重放
+                raw_frames: list[int] = json.loads(r["frames_raw_json"])
+                within: set[int] = set()
+                dup_seen: set[int] = set()
+                for f in raw_frames:  # 原始列表，检出批内重复
+                    if f in dup_seen:
+                        within.add(f)
+                    dup_seen.add(f)
+                frame_set = set(raw_frames)
+                added = sorted(frame_set - seen)
+                duplicates = sorted(within | (frame_set & seen))
+                conn.execute(
+                    """UPDATE batches
+                          SET frames_merged_json = ?, duplicates_json = ?
+                        WHERE id = ?""",
+                    (json.dumps(added), json.dumps(duplicates), r["id"]),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO roll_expected (roll_no, start_no, end_no) VALUES (?, ?, ?)",
+                    (roll_no, r["expected_start"], r["expected_end"]),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO roll_frames (roll_no, frame_no, batch_id) VALUES (?, ?, ?)",
+                    [(roll_no, f, r["id"]) for f in added],
+                )
+                seen |= frame_set
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    roll_state = get_roll_state(conn, roll_no)
+    return schemas.BatchDeleteResult(
+        batch_id=batch_id,
+        roll_no=roll_no,
+        roll_exists=roll_state is not None,
+        roll_state=roll_state,
+    )
 
 
 # ---------- 补扫任务认领 ----------
