@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持补扫任务认领。",
-    version="1.1.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销与补扫任务认领。",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -60,6 +60,34 @@ def get_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return result
+
+
+@app.delete(
+    "/batches/{batch_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["批次"],
+)
+def delete_batch(batch_id: str, conn: Connection = Depends(database.get_db)):
+    """撤销一个误导入的批次。
+
+    删除该批并按剩余批次原导入顺序重建预期范围、帧归属及各批新增/重复明细
+    （共享帧不会丢失，批内重复保留）。批次不存在返回 404；若剩余批次为无法
+    区分批内/跨批重复的旧数据，返回 409 且数据不变。
+    """
+    try:
+        services.delete_batch(conn, batch_id.strip())
+    except services.BatchNotFoundError:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    except services.LegacyBatchDataError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "撤销被拒绝：该胶卷存在旧版格式的历史批次，缺少原始帧列表，"
+                f"无法区分批内与跨批重复（相关批次：{', '.join(e.legacy_batch_ids)}）；"
+                "为保证重建结果准确，本次未改动任何数据。"
+            ),
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/rolls", response_model=list[schemas.RollSummary], tags=["胶卷"])

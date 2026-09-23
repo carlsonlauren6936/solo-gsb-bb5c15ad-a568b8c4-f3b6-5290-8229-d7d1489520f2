@@ -118,7 +118,7 @@ def _all_frames(conn: sqlite3.Connection, roll_no: str) -> set[int]:
 
 def _batch_metas(conn: sqlite3.Connection, roll_no: str) -> list[schemas.BatchMeta]:
     rows = conn.execute(
-        """SELECT id, expected_start, expected_end, frames_json,
+        """SELECT id, expected_start, expected_end, frames_json, raw_frames_json,
                   frames_merged_json, duplicates_json, created_at
              FROM batches WHERE roll_no = ? ORDER BY created_at, rowid""",
         (roll_no,),
@@ -128,7 +128,8 @@ def _batch_metas(conn: sqlite3.Connection, roll_no: str) -> list[schemas.BatchMe
             batch_id=r["id"],
             expected_start=r["expected_start"],
             expected_end=r["expected_end"],
-            frames=json.loads(r["frames_json"]),
+            # 新批次保留原始帧列表（含批内重复、保序）；旧库迁移来的批次退回去重集合
+            frames=json.loads(r["raw_frames_json"] or r["frames_json"]),
             added_frames=json.loads(r["frames_merged_json"]),
             duplicates=json.loads(r["duplicates_json"]),
             created_at=r["created_at"],
@@ -214,6 +215,7 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
     幂等保证：(roll_no, 内容指纹) 唯一。相同内容重复导入不写任何数据。
     """
     frames = sorted(set(data.frames))
+    raw_frames = list(data.frames)  # 保留原始帧列表（含批内重复、保序），供撤销时重建
     digest = content_hash(
         data.roll_no, data.expected_start, data.expected_end, frames
     )
@@ -258,14 +260,15 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
         conn.execute(
             """INSERT INTO batches
                (id, roll_no, expected_start, expected_end, frames_json,
-                frames_merged_json, duplicates_json, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                raw_frames_json, frames_merged_json, duplicates_json, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 batch_id,
                 data.roll_no,
                 data.expected_start,
                 data.expected_end,
                 json.dumps(frames),
+                json.dumps(raw_frames),
                 json.dumps(new_frames),
                 json.dumps(duplicates),
                 digest,
@@ -306,6 +309,123 @@ class BatchIdConflictError(Exception):
     def __init__(self, batch_id: str):
         self.batch_id = batch_id
         super().__init__(f"batch_id 已被其他内容占用: {batch_id}")
+
+
+# ---------- 批次撤销 ----------
+
+class BatchNotFoundError(Exception):
+    def __init__(self, batch_id: str):
+        self.batch_id = batch_id
+        super().__init__(f"批次不存在: {batch_id}")
+
+
+class LegacyBatchDataError(Exception):
+    """旧版库遗留批次缺少原始帧列表，撤销后无法区分批内与跨批重复。"""
+
+    def __init__(self, legacy_batch_ids: list[str]):
+        self.legacy_batch_ids = legacy_batch_ids
+        super().__init__(
+            f"存在无法区分批内/跨批重复的旧批次: {', '.join(legacy_batch_ids)}"
+        )
+
+
+def _within_batch_duplicates(raw_frames: list[int]) -> set[int]:
+    """从原始帧列表中检出批内重复出现的帧号。"""
+    seen: set[int] = set()
+    dups: set[int] = set()
+    for f in raw_frames:
+        if f in seen:
+            dups.add(f)
+        seen.add(f)
+    return dups
+
+
+def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
+    """撤销一个误导入批次，全程在同一 SQLite 写事务内完成（失败整体回滚）。
+
+    - 批次不存在：抛 BatchNotFoundError（接口返回 404），不触碰数据。
+    - 删除目标批次后，按剩余批次的**原导入顺序**重建：
+      预期范围集合（roll_expected）、帧归属（roll_frames，共享帧归最早扫到它
+      的剩余批次，故共享帧不会随首个批次丢失）、各批新增帧与重复帧明细
+      （批内重复保留；跨批重复按重建后的前缀集合重算）。
+    - 若剩余批次中存在旧版数据（raw_frames_json 为 NULL，无法区分批内与
+      跨批重复），抛 LegacyBatchDataError（接口返回 409）且不改变任何数据。
+    - 最后一批撤销后胶卷视为不存在：清空其预期范围与帧，并把该胶卷全部
+      未释放的历史认领标记为已释放，使其不阻碍同编号胶卷重新导入后的领取。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        target = conn.execute(
+            "SELECT id, roll_no FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if target is None:
+            raise BatchNotFoundError(batch_id)
+        roll_no = target["roll_no"]
+
+        remaining = conn.execute(
+            """SELECT id, expected_start, expected_end, raw_frames_json
+                 FROM batches
+                WHERE roll_no = ? AND id != ?
+                ORDER BY created_at, rowid""",
+            (roll_no, batch_id),
+        ).fetchall()
+
+        # 旧批次只有去重后的帧集合，无法重算“批内重复 + 跨批重复”明细
+        legacy = [r["id"] for r in remaining if r["raw_frames_json"] is None]
+        if legacy:
+            raise LegacyBatchDataError(legacy)
+
+        # 先清空帧归属再删批次，避免外键约束；随后按剩余批次整体重建
+        conn.execute(
+            "DELETE FROM roll_frames WHERE roll_no = ?", (roll_no,)
+        )
+        conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+        conn.execute(
+            "DELETE FROM roll_expected WHERE roll_no = ?", (roll_no,)
+        )
+
+        if not remaining:
+            # 胶卷下再无批次：胶卷视为不存在。历史认领即时释放，
+            # 同编号胶卷重新导入后不会被旧认领占住缺帧。
+            conn.execute(
+                """UPDATE rescan_claims
+                      SET released_at = ?
+                    WHERE roll_no = ? AND released_at IS NULL""",
+                (_now_iso(), roll_no),
+            )
+            conn.execute("COMMIT")
+            return
+
+        conn.executemany(
+            "INSERT OR IGNORE INTO roll_expected (roll_no, start_no, end_no) VALUES (?, ?, ?)",
+            [(roll_no, r["expected_start"], r["expected_end"]) for r in remaining],
+        )
+
+        owned: set[int] = set()  # 按原导入顺序，此前批次已扫到的帧
+        for r in remaining:
+            raw_frames = json.loads(r["raw_frames_json"])
+            frame_set = set(raw_frames)
+            within_dup = _within_batch_duplicates(raw_frames)  # 批内重复保留
+            new_frames = sorted(frame_set - owned)
+            duplicates = sorted(within_dup | (frame_set & owned))
+
+            conn.executemany(
+                """INSERT OR IGNORE INTO roll_frames
+                       (roll_no, frame_no, batch_id) VALUES (?, ?, ?)""",
+                [(roll_no, f, r["id"]) for f in new_frames],
+            )
+            conn.execute(
+                """UPDATE batches
+                      SET frames_merged_json = ?, duplicates_json = ?
+                    WHERE id = ?""",
+                (json.dumps(new_frames), json.dumps(duplicates), r["id"]),
+            )
+            owned |= frame_set
+
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # ---------- 补扫任务认领 ----------

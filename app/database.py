@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS batches (
     expected_start  INTEGER NOT NULL,
     expected_end    INTEGER NOT NULL,
     frames_json     TEXT NOT NULL,
+    raw_frames_json TEXT,
     frames_merged_json TEXT NOT NULL DEFAULT '[]',
     duplicates_json TEXT NOT NULL DEFAULT '[]',
     content_hash    TEXT NOT NULL,
@@ -79,10 +80,17 @@ CREATE INDEX IF NOT EXISTS idx_claims_roll ON rescan_claims (roll_no);
 
 
 def init_db() -> None:
-    """幂等建表：每次启动执行，已存在的库不受影响。"""
+    """幂等建表：每次启动执行，已存在的库不受影响。
+
+    旧版库（没有 raw_frames_json 列）通过 ALTER TABLE 平滑升级；
+    旧批次该列为 NULL，撤销时据此判定能否安全重建（详见 services.delete_batch）。
+    """
     conn = _connect()
     try:
         conn.executescript(SCHEMA)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
+        if "raw_frames_json" not in cols:
+            conn.execute("ALTER TABLE batches ADD COLUMN raw_frames_json TEXT")
     finally:
         conn.close()
 
